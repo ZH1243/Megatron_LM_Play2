@@ -21,6 +21,7 @@ import gc
 import inspect
 import logging
 import math
+import re
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
@@ -3896,6 +3897,82 @@ class AllGatherPipeline:
             # all-gather parameters across groups.
             self.outer_fsdp_group_param_gather_stream = torch.cuda.Stream()
 
+    def _get_bucket_layer_label(self, bucket_id: int) -> str:
+        """Infer a human-readable layer label from parameter names in a bucket."""
+        param_names = [
+            self.buffer.param_to_name[param]
+            for param in self.buffer.parameter_groups[bucket_id].params
+        ]
+        layer_numbers = []
+        for name in param_names:
+            match = re.search(r"(?:^|\.)(?:layers|layer)\.(\d+)(?:\.|$)", name)
+            if match is not None:
+                # MCore transformer layer numbers in compute NVTX ranges are 1-based.
+                layer_numbers.append(int(match.group(1)) + 1)
+
+        unique_layer_numbers = sorted(set(layer_numbers))
+        if len(unique_layer_numbers) == 1:
+            return str(unique_layer_numbers[0])
+        if len(unique_layer_numbers) > 1:
+            return "+".join(str(layer_number) for layer_number in unique_layer_numbers)
+
+        fsdp_unit_id = self.buffer.parameter_groups[bucket_id].fsdp_unit_id
+        return f"fsdp_unit_{fsdp_unit_id}" if fsdp_unit_id is not None else "none"
+
+    def _get_param_kind_from_name(self, param_name: str, is_expert_param: bool) -> str:
+        """Infer which module family a parameter belongs to for profiler labels."""
+        if is_expert_param:
+            return "moe_expert"
+        if ".experts." in param_name:
+            return "moe_expert"
+        if any(moe_token in param_name for moe_token in [".router.", ".shared_expert"]):
+            return "moe"
+        if any(
+            attention_token in param_name
+            for attention_token in [".self_attention.", ".cross_attention.", ".attention."]
+        ):
+            return "attention"
+        if ".mlp." in param_name:
+            return "mlp"
+        if any(norm_token in param_name for norm_token in ["layernorm", "layer_norm", "_norm"]):
+            return "norm"
+        if "embedding" in param_name:
+            return "embedding"
+        if any(output_token in param_name for output_token in ["output_layer", "lm_head"]):
+            return "output"
+        return "other"
+
+    def _get_bucket_param_kind_label(self, bucket_id: int) -> str:
+        """Infer a compact module-kind label from all parameters in a bucket."""
+        param_group = self.buffer.parameter_groups[bucket_id]
+        kinds = [
+            self._get_param_kind_from_name(
+                self.buffer.param_to_name[param], param_group.is_expert_param
+            )
+            for param in param_group.params
+        ]
+        unique_kinds = sorted(set(kinds))
+        return "+".join(unique_kinds)
+
+    def _get_all_gather_nvtx_msg(
+        self,
+        bucket_id: int,
+        requested_ag_buckets: set,
+        bwd: bool,
+        outer_fsdp_group_param_gather: bool = False,
+    ) -> str:
+        """Build an NVTX label for a parameter all-gather bucket."""
+        param_group = self.buffer.parameter_groups[bucket_id]
+        phase = "current" if bucket_id in requested_ag_buckets else "prefetch"
+        direction = "bwd" if bwd else "fwd"
+        scope = "outer_fsdp" if outer_fsdp_group_param_gather else "fsdp"
+        return (
+            f"{scope}.param_all_gather.{phase}."
+            f"layer={self._get_bucket_layer_label(bucket_id)}."
+            f"kind={self._get_bucket_param_kind_label(bucket_id)}."
+            f"direction={direction}.fsdp_unit={param_group.fsdp_unit_id}.bucket={bucket_id}"
+        )
+
     def get_bucket_key(self, bucket_id, bwd):
         """Get the key for the bucket."""
         has_transpose_buffer = (
@@ -3968,6 +4045,7 @@ class AllGatherPipeline:
 
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
+        requested_ag_buckets = set(ag_buckets)
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:
             double_buf_units = set()
@@ -4084,18 +4162,41 @@ class AllGatherPipeline:
                     outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
                         is_expert_parallel=is_expert_parallel
                     )
-                    with _coalescing_manager(outer_fsdp_group, async_ops=False):
-                        for bucket_id in buckets:
-                            inner_dp_wbuf = self.get_fsdp_buffer(bucket_id, bwd=bwd)
-                            shard_size = inner_dp_wbuf.data_size // outer_fsdp_group.size()
-                            rank = outer_fsdp_group.rank()
-                            torch.distributed.all_gather_into_tensor(
-                                output_tensor=inner_dp_wbuf.data,
-                                input_tensor=inner_dp_wbuf.data[
-                                    rank * shard_size : (rank + 1) * shard_size
-                                ],
-                                group=outer_fsdp_group,
-                            )
+                    nvtx_msg = "outer_fsdp.param_all_gather_group." + "+".join(
+                        self._get_all_gather_nvtx_msg(
+                            bucket_id,
+                            requested_ag_buckets,
+                            bwd,
+                            outer_fsdp_group_param_gather=True,
+                        )
+                        for bucket_id in buckets
+                    )
+                    torch.cuda.nvtx.range_push(nvtx_msg)
+                    try:
+                        with _coalescing_manager(outer_fsdp_group, async_ops=False):
+                            for bucket_id in buckets:
+                                inner_dp_wbuf = self.get_fsdp_buffer(bucket_id, bwd=bwd)
+                                shard_size = inner_dp_wbuf.data_size // outer_fsdp_group.size()
+                                rank = outer_fsdp_group.rank()
+                                nvtx_msg = self._get_all_gather_nvtx_msg(
+                                    bucket_id,
+                                    requested_ag_buckets,
+                                    bwd,
+                                    outer_fsdp_group_param_gather=True,
+                                )
+                                torch.cuda.nvtx.range_push(nvtx_msg)
+                                try:
+                                    torch.distributed.all_gather_into_tensor(
+                                        output_tensor=inner_dp_wbuf.data,
+                                        input_tensor=inner_dp_wbuf.data[
+                                            rank * shard_size : (rank + 1) * shard_size
+                                        ],
+                                        group=outer_fsdp_group,
+                                    )
+                                finally:
+                                    torch.cuda.nvtx.range_pop()
+                    finally:
+                        torch.cuda.nvtx.range_pop()
                 # Wait for the DP-Outer group all-gather to finish.
                 all_gather_stream.wait_stream(self.outer_fsdp_group_param_gather_stream)
 
@@ -4103,13 +4204,28 @@ class AllGatherPipeline:
             all_gather_stream.wait_stream(torch.cuda.current_stream())
             dp_group = self.get_fsdp_buffer(buckets[0]).data_parallel_group
             with torch.cuda.stream(all_gather_stream):
-                with _coalescing_manager(
-                    dp_group, async_ops=async_param_gather
-                ) as coalescing_event:
-                    for bucket_id in buckets:
-                        # All-gather the module weights from each FSDP buffer shard
-                        # into an allocated bucket containing unsharded weights.
-                        self.async_bucket_gather(bucket_id, bwd)
+                nvtx_msg = "fsdp.param_all_gather_group." + "+".join(
+                    self._get_all_gather_nvtx_msg(bucket_id, requested_ag_buckets, bwd)
+                    for bucket_id in buckets
+                )
+                torch.cuda.nvtx.range_push(nvtx_msg)
+                try:
+                    with _coalescing_manager(
+                        dp_group, async_ops=async_param_gather
+                    ) as coalescing_event:
+                        for bucket_id in buckets:
+                            # All-gather the module weights from each FSDP buffer shard
+                            # into an allocated bucket containing unsharded weights.
+                            nvtx_msg = self._get_all_gather_nvtx_msg(
+                                bucket_id, requested_ag_buckets, bwd
+                            )
+                            torch.cuda.nvtx.range_push(nvtx_msg)
+                            try:
+                                self.async_bucket_gather(bucket_id, bwd)
+                            finally:
+                                torch.cuda.nvtx.range_pop()
+                finally:
+                    torch.cuda.nvtx.range_pop()
 
             # Replace the parameter all-gather event with coalescing event.
             for bucket_id in buckets:

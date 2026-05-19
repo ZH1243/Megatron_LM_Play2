@@ -611,7 +611,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self._set_proj_residual(residual)
 
         # Self attention.
-        nvtx_range_push(suffix="self_attention")
+        attention_nvtx_msg = f"layer={self.layer_number}.attention_compute"
+        nvtx_range_push(attention_nvtx_msg)
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -624,7 +625,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
-        nvtx_range_pop(suffix="self_attention")
+        nvtx_range_pop(attention_nvtx_msg)
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
@@ -764,7 +765,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
-        nvtx_range_push(suffix="mlp")
+        mlp_nvtx_msg = (
+            f"layer={self.layer_number}.moe_compute"
+            if self.is_moe_layer
+            else f"layer={self.layer_number}.mlp_compute"
+        )
+        nvtx_range_push(mlp_nvtx_msg)
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
         should_chunk_mlp_for_prefill = (
             self.config.mlp_chunks_for_prefill > 1
@@ -817,7 +823,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
 
-        nvtx_range_pop(suffix="mlp")
+        nvtx_range_pop(mlp_nvtx_msg)
 
         if (
             self.is_moe_layer

@@ -50,6 +50,36 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 logger = logging.getLogger(__name__)
 
 
+def _summarize_split_sizes(split_sizes) -> str:
+    """Summarize A2A split sizes without creating very long NVTX messages."""
+    if split_sizes is None:
+        return "equal"
+    return f"len={len(split_sizes)},sum={int(sum(split_sizes))}"
+
+
+def _moe_comm_nvtx_msg(
+    dispatcher: str,
+    phase: str,
+    op: str,
+    tensor: torch.Tensor,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    output_split_sizes=None,
+    input_split_sizes=None,
+) -> str:
+    """Build an NVTX label for MoE communication calls."""
+    group_size = group.size() if group is not None else 1
+    msg = (
+        f"moe.{dispatcher}.{phase}.{op}."
+        f"input_shape={tuple(tensor.shape)}.group_size={group_size}"
+    )
+    if output_split_sizes is not None or input_split_sizes is not None:
+        msg = (
+            f"{msg}.output_splits={_summarize_split_sizes(output_split_sizes)}."
+            f"input_splits={_summarize_split_sizes(input_split_sizes)}"
+        )
+    return msg
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -265,18 +295,44 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             with torch.no_grad():
                 # [num_local_tokens, num_experts] -> [num_global_tokens, num_experts], where:
                 #     num_local_tokens=(S/TP)*B, num_global_tokens=S*B*EP
-                self.routing_map = gather_from_sequence_parallel_region(
-                    self.routing_map, group=self.tp_ep_group
+                nvtx_msg = _moe_comm_nvtx_msg(
+                    "allgather", "dispatch", "all_gather.routing_map", self.routing_map,
+                    self.tp_ep_group
                 )
+                utils.nvtx_range_push(nvtx_msg)
+                try:
+                    self.routing_map = gather_from_sequence_parallel_region(
+                        self.routing_map, group=self.tp_ep_group
+                    )
+                finally:
+                    utils.nvtx_range_pop(nvtx_msg)
 
             ## local_probs calculation
             # max_prob: [S/TP*B, num_experts] -> global_probs: [S*B*EP, num_experts]
-            probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
+            nvtx_msg = _moe_comm_nvtx_msg(
+                "allgather", "dispatch", "all_gather.probs", probs, self.tp_ep_group
+            )
+            utils.nvtx_range_push(nvtx_msg)
+            try:
+                probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
+            finally:
+                utils.nvtx_range_pop(nvtx_msg)
             # Note that this allgather spans the communication domain of TP*EP.
             #  [(S/TP)*B, H] -> [((S/TP)*B)*(TP*EP), H] = [S*B*EP, H]
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, group=self.tp_ep_group, use_global_buffer=True
+            nvtx_msg = _moe_comm_nvtx_msg(
+                "allgather",
+                "dispatch",
+                "all_gather.hidden_states",
+                hidden_states,
+                self.tp_ep_group,
             )
+            utils.nvtx_range_push(nvtx_msg)
+            try:
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, group=self.tp_ep_group, use_global_buffer=True
+                )
+            finally:
+                utils.nvtx_range_pop(nvtx_msg)
 
         return hidden_states, probs
 
@@ -340,9 +396,21 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         """
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
-            hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
-            ).to(hidden_states.dtype)
+            reduce_scatter_input = hidden_states.to(self.local_probs.dtype)
+            nvtx_msg = _moe_comm_nvtx_msg(
+                "allgather",
+                "combine",
+                "reduce_scatter.hidden_states",
+                reduce_scatter_input,
+                self.tp_ep_group,
+            )
+            utils.nvtx_range_push(nvtx_msg)
+            try:
+                hidden_states = reduce_scatter_to_sequence_parallel_region(
+                    reduce_scatter_input, group=self.tp_ep_group
+                ).to(hidden_states.dtype)
+            finally:
+                utils.nvtx_range_pop(nvtx_msg)
         return hidden_states
 
     def combine_postprocess(self, hidden_states):
@@ -540,13 +608,24 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # num_global_tokens_per_expert represents the number of tokens sent to each
             # expert by all ranks.
             # [tp_size, ep_size, num_experts]
-            num_global_tokens_per_expert = (
-                gather_from_sequence_parallel_region(
-                    num_local_tokens_per_expert, group=self.tp_ep_group
-                )
-                .reshape(self.ep_size, self.tp_size, self.num_experts)
-                .transpose(0, 1)
+            nvtx_msg = _moe_comm_nvtx_msg(
+                "alltoall",
+                "dispatch_metadata",
+                "all_gather.tokens_per_expert",
+                num_local_tokens_per_expert,
+                self.tp_ep_group,
             )
+            utils.nvtx_range_push(nvtx_msg)
+            try:
+                num_global_tokens_per_expert = (
+                    gather_from_sequence_parallel_region(
+                        num_local_tokens_per_expert, group=self.tp_ep_group
+                    )
+                    .reshape(self.ep_size, self.tp_size, self.num_experts)
+                    .transpose(0, 1)
+                )
+            finally:
+                utils.nvtx_range_pop(nvtx_msg)
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
@@ -674,26 +753,52 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
-        global_input_tokens = all_to_all(
-            self.ep_group,
+        nvtx_msg = _moe_comm_nvtx_msg(
+            "alltoall",
+            "dispatch",
+            "all_to_all.hidden_states",
             permutated_local_input_tokens,
-            self.output_splits,
-            self.input_splits,
-            use_nccl_stream=self.use_nccl_stream,
+            self.ep_group,
+            output_split_sizes=self.output_splits,
+            input_split_sizes=self.input_splits,
         )
+        utils.nvtx_range_push(nvtx_msg)
+        try:
+            global_input_tokens = all_to_all(
+                self.ep_group,
+                permutated_local_input_tokens,
+                self.output_splits,
+                self.input_splits,
+                use_nccl_stream=self.use_nccl_stream,
+            )
+        finally:
+            utils.nvtx_range_pop(nvtx_msg)
         # Move the shared experts fc1 right after the tokens A2A, to prevent the probs A2A
         # block the launch of fc1 GEMM when CUDA_DEVICE_MAX_CONNECTIONS=1.
         # Forward launch order: tokens A2A -> shared experts fc1 -> probs A2A
         # Backward launch order: probs A2A -> tokens A2A -> shared experts fc1
         if self.shared_experts is not None:
             self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
-        global_probs = all_to_all(
-            self.ep_group,
+        nvtx_msg = _moe_comm_nvtx_msg(
+            "alltoall",
+            "dispatch",
+            "all_to_all.probs",
             permuted_probs,
-            self.output_splits,
-            self.input_splits,
-            use_nccl_stream=self.use_nccl_stream,
+            self.ep_group,
+            output_split_sizes=self.output_splits,
+            input_split_sizes=self.input_splits,
         )
+        utils.nvtx_range_push(nvtx_msg)
+        try:
+            global_probs = all_to_all(
+                self.ep_group,
+                permuted_probs,
+                self.output_splits,
+                self.input_splits,
+                use_nccl_stream=self.use_nccl_stream,
+            )
+        finally:
+            utils.nvtx_range_pop(nvtx_msg)
 
         return global_input_tokens, global_probs
 
@@ -715,12 +820,36 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 output_split_sizes = None
             else:
                 output_split_sizes = self.output_splits_tp.tolist()
-            global_input_tokens = gather_from_sequence_parallel_region(
-                global_input_tokens, group=self.tp_group, output_split_sizes=output_split_sizes
+            nvtx_msg = _moe_comm_nvtx_msg(
+                "alltoall",
+                "dispatch_postprocess",
+                "all_gather.hidden_states",
+                global_input_tokens,
+                self.tp_group,
+                output_split_sizes=output_split_sizes,
             )
-            global_probs = gather_from_sequence_parallel_region(
-                global_probs, group=self.tp_group, output_split_sizes=output_split_sizes
+            utils.nvtx_range_push(nvtx_msg)
+            try:
+                global_input_tokens = gather_from_sequence_parallel_region(
+                    global_input_tokens, group=self.tp_group, output_split_sizes=output_split_sizes
+                )
+            finally:
+                utils.nvtx_range_pop(nvtx_msg)
+            nvtx_msg = _moe_comm_nvtx_msg(
+                "alltoall",
+                "dispatch_postprocess",
+                "all_gather.probs",
+                global_probs,
+                self.tp_group,
+                output_split_sizes=output_split_sizes,
             )
+            utils.nvtx_range_push(nvtx_msg)
+            try:
+                global_probs = gather_from_sequence_parallel_region(
+                    global_probs, group=self.tp_group, output_split_sizes=output_split_sizes
+                )
+            finally:
+                utils.nvtx_range_pop(nvtx_msg)
 
         # Permutation 2: Sort tokens by local expert.
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -798,11 +927,24 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 input_split_sizes = None
             else:
                 input_split_sizes = self.output_splits_tp.tolist()
-            hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.probs.dtype),
-                group=self.tp_group,
+            reduce_scatter_input = hidden_states.to(self.probs.dtype)
+            nvtx_msg = _moe_comm_nvtx_msg(
+                "alltoall",
+                "combine_preprocess",
+                "reduce_scatter.hidden_states",
+                reduce_scatter_input,
+                self.tp_group,
                 input_split_sizes=input_split_sizes,
-            ).to(hidden_states.dtype)
+            )
+            utils.nvtx_range_push(nvtx_msg)
+            try:
+                hidden_states = reduce_scatter_to_sequence_parallel_region(
+                    reduce_scatter_input,
+                    group=self.tp_group,
+                    input_split_sizes=input_split_sizes,
+                ).to(hidden_states.dtype)
+            finally:
+                utils.nvtx_range_pop(nvtx_msg)
 
         return hidden_states
 
@@ -833,13 +975,26 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.wait_current_stream()
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
-        permutated_local_input_tokens = all_to_all(
-            self.ep_group,
+        nvtx_msg = _moe_comm_nvtx_msg(
+            "alltoall",
+            "combine",
+            "all_to_all.hidden_states",
             hidden_states,
-            self.input_splits,
-            self.output_splits,
-            use_nccl_stream=self.use_nccl_stream,
+            self.ep_group,
+            output_split_sizes=self.input_splits,
+            input_split_sizes=self.output_splits,
         )
+        utils.nvtx_range_push(nvtx_msg)
+        try:
+            permutated_local_input_tokens = all_to_all(
+                self.ep_group,
+                hidden_states,
+                self.input_splits,
+                self.output_splits,
+                use_nccl_stream=self.use_nccl_stream,
+            )
+        finally:
+            utils.nvtx_range_pop(nvtx_msg)
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
             self.shared_experts.post_forward_comm()
@@ -1494,9 +1649,20 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
-        dispatched_hidden_states = self._comm_manager.dispatch(
-            hidden_states, async_finish, allocate_on_comm_stream
+        nvtx_msg = _moe_comm_nvtx_msg(
+            "flex",
+            "dispatch",
+            f"{self.config.moe_flex_dispatcher_backend}.dispatch",
+            hidden_states,
+            self.tp_ep_group,
         )
+        utils.nvtx_range_push(nvtx_msg)
+        try:
+            dispatched_hidden_states = self._comm_manager.dispatch(
+                hidden_states, async_finish, allocate_on_comm_stream
+            )
+        finally:
+            utils.nvtx_range_pop(nvtx_msg)
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
             self.shared_experts.linear_fc1_forward_and_act(dispatched_hidden_states)
@@ -1553,7 +1719,18 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
-        return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
+        nvtx_msg = _moe_comm_nvtx_msg(
+            "flex",
+            "combine",
+            f"{self.config.moe_flex_dispatcher_backend}.combine",
+            hidden_states,
+            self.tp_ep_group,
+        )
+        utils.nvtx_range_push(nvtx_msg)
+        try:
+            return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
+        finally:
+            utils.nvtx_range_pop(nvtx_msg)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
         """

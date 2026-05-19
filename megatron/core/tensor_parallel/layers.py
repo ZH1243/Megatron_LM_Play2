@@ -27,6 +27,8 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
+    nvtx_range_pop,
+    nvtx_range_push,
     prepare_input_tensors_for_wgrad_compute,
 )
 
@@ -318,9 +320,11 @@ class VocabParallelEmbedding(torch.nn.Module):
                 output = reduce_scatter_to_sequence_parallel_region(
                     output_parallel, group=self.tp_group
                 )
-        else:
+        elif self.tp_group.size() > 1:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+        else:
+            output = output_parallel
         return output
 
     def sharded_state_dict(
@@ -491,7 +495,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size[0] = dim_size[0] * tp_group.size()
 
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
-            dist_all_gather_func(all_gather_buffer, input, group=tp_group)
+            nvtx_msg = (
+                "tp.sequence_parallel.linear_forward_input_all_gather."
+                f"input_shape={tuple(input.shape)}.output_shape={tuple(all_gather_buffer.shape)}."
+                f"tp_size={tp_group.size()}"
+            )
+            nvtx_range_push(nvtx_msg)
+            try:
+                dist_all_gather_func(all_gather_buffer, input, group=tp_group)
+            finally:
+                nvtx_range_pop(nvtx_msg)
             total_input = all_gather_buffer
         else:
             total_input = input
@@ -530,9 +543,18 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 all_gather_buffer = get_global_memory_buffer().get_tensor(
                     dim_size, input.dtype, "mpu"
                 )
-                handle = dist_all_gather_func(
-                    all_gather_buffer, input, group=tp_group, async_op=True
+                nvtx_msg = (
+                    "tp.sequence_parallel.linear_backward_wgrad_input_all_gather.async_launch."
+                    f"input_shape={tuple(input.shape)}."
+                    f"output_shape={tuple(all_gather_buffer.shape)}.tp_size={tp_group.size()}"
                 )
+                nvtx_range_push(nvtx_msg)
+                try:
+                    handle = dist_all_gather_func(
+                        all_gather_buffer, input, group=tp_group, async_op=True
+                    )
+                finally:
+                    nvtx_range_pop(nvtx_msg)
 
                 # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
                 # gather is scheduled before the input gradient computation
@@ -563,9 +585,18 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
             )
             # reduce_scatter
-            handle = dist_reduce_scatter_func(
-                sub_grad_input, grad_input, group=tp_group, async_op=True
+            nvtx_msg = (
+                "tp.sequence_parallel.linear_backward_dgrad_reduce_scatter.async_launch."
+                f"input_shape={tuple(grad_input.shape)}."
+                f"output_shape={tuple(sub_grad_input.shape)}.tp_size={tp_group.size()}"
             )
+            nvtx_range_push(nvtx_msg)
+            try:
+                handle = dist_reduce_scatter_func(
+                    sub_grad_input, grad_input, group=tp_group, async_op=True
+                )
+            finally:
+                nvtx_range_pop(nvtx_msg)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # reduce scatter is scheduled before the weight gradient computation
 

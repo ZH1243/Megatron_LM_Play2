@@ -43,7 +43,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -59,6 +59,8 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     is_torch_min_version,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 try:
@@ -712,6 +714,8 @@ class TELinear(te.pytorch.Linear):
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         self.symmetric_ar_type = symmetric_ar_type
+        self.tp_comm_buffer_name = tp_comm_buffer_name
+        self.megatron_parallel_mode = parallel_mode
         if skip_weight_param_allocation:
             raise ValueError(
                 "Transformer Engine linear layers do not support skip_weight_param_allocation"
@@ -872,8 +876,17 @@ class TELinear(te.pytorch.Linear):
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
-        with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        nvtx_msg = (
+            "te.tp.sequence_parallel.linear_forward."
+            f"buffer={self.tp_comm_buffer_name}.parallel_mode={self.megatron_parallel_mode}."
+            f"input_shape={tuple(x.shape)}.tp_size={self.tp_size}"
+        )
+        nvtx_range_push(nvtx_msg)
+        try:
+            with quant_context:
+                out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        finally:
+            nvtx_range_pop(nvtx_msg)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -958,6 +971,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.te_return_bias = skip_bias_add and bias
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+        self.tp_comm_buffer_name = tp_comm_buffer_name
         extra_kwargs = _get_extra_te_kwargs(config)
         self.tp_size = get_pg_size(tp_group)
         self.tp_rank = get_pg_rank(tp_group)
@@ -1093,8 +1107,17 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
-        with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        nvtx_msg = (
+            "te.tp.sequence_parallel.layernorm_column_linear_forward."
+            f"buffer={self.tp_comm_buffer_name}.parallel_mode=column."
+            f"input_shape={tuple(x.shape)}.tp_size={self.tp_size}"
+        )
+        nvtx_range_push(nvtx_msg)
+        try:
+            with quant_context:
+                out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        finally:
+            nvtx_range_pop(nvtx_msg)
 
         self.is_first_microbatch = False
 
@@ -2433,6 +2456,31 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     bias = None
 
             return out, bias
+
+        @classmethod
+        def as_mlp_submodule(
+            cls,
+            submodules: MLPSubmodules,
+            config: TransformerConfig,
+            pg_collection: ProcessGroupCollection,
+            is_mtp_layer: bool,
+            is_expert: bool = False,
+            input_size: int | None = None,
+            ffn_hidden_size: int | None = None,
+        ) -> MLP:
+            """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
+            del is_mtp_layer
+            assert hasattr(
+                pg_collection, 'tp'
+            ), 'TP process group is required for TEFusedMLP in TransformerLayer'
+            return cls(
+                config=config,
+                submodules=submodules,
+                tp_group=pg_collection.tp,
+                is_expert=is_expert,
+                input_size=input_size,
+                ffn_hidden_size=ffn_hidden_size,
+            )
 
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]

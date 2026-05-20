@@ -37,6 +37,7 @@ LAYER_MLP_RE = re.compile(r"layer=(?P<layer>\d+)\.(?P<kind>moe|mlp)_compute")
 FSDP_FORWARD_RE = re.compile(r"CustomFSDP\.forward")
 FSDP_OP_ID_RE = re.compile(r"op_id\s*=\s*(?P<op_id>[^,\s]+)")
 PREFETCH_LAYER_RE = re.compile(r"prefetch\.layer=(?P<layer>\d+)")
+PREFETCH_KIND_RE = re.compile(r"kind=(?P<kind>[^.]+)")
 EXPERT_FFN_RE = re.compile(r"GroupedLinear")
 EXPERT_ACTIVATION_RE = re.compile(
     r"(WeightedSwiGLUFunction|BiasSwiGLUFunction|SwiGLUFunction|GeGLU|ReGLU|SwiGLU|GELU|ReLU)"
@@ -130,6 +131,8 @@ class LayerOccurrence:
     activation_kernels: KernelStats = field(default_factory=KernelStats)
     ffn2_kernels: KernelStats = field(default_factory=KernelStats)
     prefetch_kernels: KernelStats = field(default_factory=KernelStats)
+    prefetch_non_moe_kernels: KernelStats = field(default_factory=KernelStats)
+    prefetch_moe_kernels: KernelStats = field(default_factory=KernelStats)
 
     @property
     def key(self) -> tuple[int | None, int, int]:
@@ -566,6 +569,19 @@ def is_prefetch_range(text: str, direction: str) -> bool:
     return True
 
 
+def prefetch_kind_buckets(text: str) -> list[str]:
+    """Return prefetch kind buckets represented by an NVTX label."""
+
+    kinds = PREFETCH_KIND_RE.findall(text)
+    if not kinds:
+        return ["non_moe"]
+
+    buckets = []
+    for kind in kinds:
+        buckets.append("moe" if kind == "moe_expert" else "non_moe")
+    return sorted(set(buckets))
+
+
 def assign_prefetch(
     occurrences: list[LayerOccurrence],
     nvtx_ranges: list[NvtxRange],
@@ -617,6 +633,8 @@ def assign_prefetch(
             multi_layer_groups += 1
         stats = range_stats(nvtx_range)
         scale = 1.0 / len(target_layers)
+        kind_buckets = prefetch_kind_buckets(nvtx_range.text)
+        kind_scale = 1.0 / len(kind_buckets)
         for layer in target_layers:
             owners = sorted(by_layer.get(layer, []), key=lambda item: item.layer_start)
             if not owners:
@@ -636,6 +654,11 @@ def assign_prefetch(
                 owners[-1],
             )
             owner.prefetch_kernels.add_stats(stats, scale=scale)
+            for kind_bucket in kind_buckets:
+                if kind_bucket == "moe":
+                    owner.prefetch_moe_kernels.add_stats(stats, scale=scale * kind_scale)
+                else:
+                    owner.prefetch_non_moe_kernels.add_stats(stats, scale=scale * kind_scale)
     return multi_layer_groups
 
 
@@ -697,8 +720,19 @@ def layer_rows(occurrences: list[LayerOccurrence]) -> list[dict[str, Any]]:
                 "moe_ffn2_kernel_count": occurrence.ffn2_kernels.count,
                 "param_prefetch_kernel_ms": occurrence.prefetch_kernels.total_ms,
                 "param_prefetch_kernel_count": occurrence.prefetch_kernels.count,
+                "param_prefetch_non_moe_kernel_ms": occurrence.prefetch_non_moe_kernels.total_ms,
+                "param_prefetch_non_moe_kernel_count": occurrence.prefetch_non_moe_kernels.count,
+                "param_prefetch_moe_kernel_ms": occurrence.prefetch_moe_kernels.total_ms,
+                "param_prefetch_moe_kernel_count": occurrence.prefetch_moe_kernels.count,
                 "top_prefetch_kernels": "; ".join(
                     f"{name} ({count:g})" for name, count in occurrence.prefetch_kernels.names.most_common(3)
+                ),
+                "top_prefetch_non_moe_kernels": "; ".join(
+                    f"{name} ({count:g})"
+                    for name, count in occurrence.prefetch_non_moe_kernels.names.most_common(3)
+                ),
+                "top_prefetch_moe_kernels": "; ".join(
+                    f"{name} ({count:g})" for name, count in occurrence.prefetch_moe_kernels.names.most_common(3)
                 ),
                 "top_dispatch_kernels": "; ".join(
                     f"{name} ({count:g})" for name, count in occurrence.dispatch_kernels.names.most_common(3)
@@ -747,6 +781,8 @@ def summary_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "moe_activation_kernel_ms",
         "moe_ffn2_kernel_ms",
         "param_prefetch_kernel_ms",
+        "param_prefetch_non_moe_kernel_ms",
+        "param_prefetch_moe_kernel_ms",
     ]
     summaries: list[dict[str, Any]] = []
     for layer, layer_group in sorted(grouped.items()):
@@ -789,6 +825,8 @@ def print_summary(rows: list[dict[str, Any]], limit: int | None, statistic: str)
         ("activation", f"{prefix}_moe_activation_kernel_ms"),
         ("ffn2", f"{prefix}_moe_ffn2_kernel_ms"),
         ("prefetch", f"{prefix}_param_prefetch_kernel_ms"),
+        ("pref_non_moe", f"{prefix}_param_prefetch_non_moe_kernel_ms"),
+        ("pref_moe", f"{prefix}_param_prefetch_moe_kernel_ms"),
     ]
     print(f"Summary {statistic} values in ms:")
     print("  cpu_wall is the CPU NVTX interval; *_gpu columns sum attributed GPU kernel durations.")
@@ -816,6 +854,8 @@ def print_outlier_notes(rows: list[dict[str, Any]], top_n: int = 5) -> None:
         ("moe_ffn1_kernel_ms", "ffn1"),
         ("moe_activation_kernel_ms", "activation"),
         ("moe_ffn2_kernel_ms", "ffn2"),
+        ("param_prefetch_non_moe_kernel_ms", "pref_non_moe"),
+        ("param_prefetch_moe_kernel_ms", "pref_moe"),
         ("layer_kernel_ms", "layer_gpu"),
     ]
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)

@@ -119,6 +119,8 @@ class LayerOccurrence:
     attention_kernels: KernelStats = field(default_factory=KernelStats)
     mlp_kernels: KernelStats = field(default_factory=KernelStats)
     dispatch_kernels: KernelStats = field(default_factory=KernelStats)
+    dispatch_hidden_states_kernels: KernelStats = field(default_factory=KernelStats)
+    dispatch_metadata_tokens_per_expert_kernels: KernelStats = field(default_factory=KernelStats)
     combine_kernels: KernelStats = field(default_factory=KernelStats)
     prefetch_kernels: KernelStats = field(default_factory=KernelStats)
 
@@ -474,8 +476,17 @@ def assign_moe_comm(
     moe_occurrences = [item for item in occurrences if item.mlp is not None and item.mlp_kind == "moe"]
     for nvtx_range in nvtx_ranges:
         is_dispatch = bool(re.search(r"^moe\..*\.dispatch\.", nvtx_range.text))
+        is_dispatch_hidden_states = bool(
+            re.search(r"^moe\..*\.dispatch\..*hidden_states(?:\.|$)", nvtx_range.text)
+        )
+        is_dispatch_metadata_tokens_per_expert = bool(
+            re.search(
+                r"^moe\..*\.dispatch_metadata\.all_gather\.tokens_per_expert(?:\.|$)",
+                nvtx_range.text,
+            )
+        )
         is_combine = bool(re.search(r"^moe\..*\.combine\.", nvtx_range.text))
-        if not is_dispatch and not is_combine:
+        if not is_dispatch and not is_dispatch_metadata_tokens_per_expert and not is_combine:
             continue
         owner = next(
             (
@@ -489,6 +500,10 @@ def assign_moe_comm(
             continue
         if is_dispatch:
             owner.dispatch_kernels.add_stats(kernels.stats_for_range(nvtx_range))
+        if is_dispatch_hidden_states:
+            owner.dispatch_hidden_states_kernels.add_stats(kernels.stats_for_range(nvtx_range))
+        if is_dispatch_metadata_tokens_per_expert:
+            owner.dispatch_metadata_tokens_per_expert_kernels.add_stats(kernels.stats_for_range(nvtx_range))
         if is_combine:
             owner.combine_kernels.add_stats(kernels.stats_for_range(nvtx_range))
 
@@ -614,6 +629,14 @@ def layer_rows(occurrences: list[LayerOccurrence]) -> list[dict[str, Any]]:
                 "mlp_or_moe_kernel_count": occurrence.mlp_kernels.count,
                 "moe_dispatch_kernel_ms": occurrence.dispatch_kernels.total_ms,
                 "moe_dispatch_kernel_count": occurrence.dispatch_kernels.count,
+                "moe_dispatch_hidden_states_kernel_ms": occurrence.dispatch_hidden_states_kernels.total_ms,
+                "moe_dispatch_hidden_states_kernel_count": occurrence.dispatch_hidden_states_kernels.count,
+                "moe_dispatch_metadata_tokens_per_expert_kernel_ms": (
+                    occurrence.dispatch_metadata_tokens_per_expert_kernels.total_ms
+                ),
+                "moe_dispatch_metadata_tokens_per_expert_kernel_count": (
+                    occurrence.dispatch_metadata_tokens_per_expert_kernels.count
+                ),
                 "moe_combine_kernel_ms": occurrence.combine_kernels.total_ms,
                 "moe_combine_kernel_count": occurrence.combine_kernels.count,
                 "param_prefetch_kernel_ms": occurrence.prefetch_kernels.total_ms,
@@ -623,6 +646,14 @@ def layer_rows(occurrences: list[LayerOccurrence]) -> list[dict[str, Any]]:
                 ),
                 "top_dispatch_kernels": "; ".join(
                     f"{name} ({count:g})" for name, count in occurrence.dispatch_kernels.names.most_common(3)
+                ),
+                "top_dispatch_hidden_states_kernels": "; ".join(
+                    f"{name} ({count:g})"
+                    for name, count in occurrence.dispatch_hidden_states_kernels.names.most_common(3)
+                ),
+                "top_dispatch_metadata_tokens_per_expert_kernels": "; ".join(
+                    f"{name} ({count:g})"
+                    for name, count in occurrence.dispatch_metadata_tokens_per_expert_kernels.names.most_common(3)
                 ),
                 "top_combine_kernels": "; ".join(
                     f"{name} ({count:g})" for name, count in occurrence.combine_kernels.names.most_common(3)
@@ -644,6 +675,8 @@ def summary_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "attention_kernel_ms",
         "mlp_or_moe_kernel_ms",
         "moe_dispatch_kernel_ms",
+        "moe_dispatch_hidden_states_kernel_ms",
+        "moe_dispatch_metadata_tokens_per_expert_kernel_ms",
         "moe_combine_kernel_ms",
         "param_prefetch_kernel_ms",
     ]
@@ -681,7 +714,8 @@ def print_summary(rows: list[dict[str, Any]], limit: int | None, statistic: str)
         ("layer_gpu", f"{prefix}_layer_kernel_ms"),
         ("attn_gpu", f"{prefix}_attention_kernel_ms"),
         ("mlp_gpu", f"{prefix}_mlp_or_moe_kernel_ms"),
-        ("dispatch", f"{prefix}_moe_dispatch_kernel_ms"),
+        ("disp_hid", f"{prefix}_moe_dispatch_hidden_states_kernel_ms"),
+        ("disp_meta", f"{prefix}_moe_dispatch_metadata_tokens_per_expert_kernel_ms"),
         ("combine", f"{prefix}_moe_combine_kernel_ms"),
         ("prefetch", f"{prefix}_param_prefetch_kernel_ms"),
     ]
@@ -705,6 +739,8 @@ def print_outlier_notes(rows: list[dict[str, Any]], top_n: int = 5) -> None:
     outliers: list[tuple[float, dict[str, Any], str, float, float]] = []
     checks = [
         ("mlp_or_moe_kernel_ms", "mlp_gpu"),
+        ("moe_dispatch_hidden_states_kernel_ms", "disp_hid"),
+        ("moe_dispatch_metadata_tokens_per_expert_kernel_ms", "disp_meta"),
         ("moe_combine_kernel_ms", "combine"),
         ("layer_kernel_ms", "layer_gpu"),
     ]

@@ -49,7 +49,7 @@ MOE_ARGS=(
     --expert-tensor-parallel-size 1 # The example does not use this. Maybe the default is 1
     --moe-router-load-balancing-type aux_loss # The example uses aux_loss
     --moe-router-topk 2 # The example uses 2
-    --moe-aux-loss-coeff 1e-2 # The example uses 1e-2
+    --moe-aux-loss-coeff 1e-2 # The example uses 1e-2 (***)
     --moe-grouped-gemm # The example uses grouped-gemm
     --moe-permute-fusion # The example uses permute-fusion
     --moe-token-dispatcher-type alltoall # The example uses alltoall (***)
@@ -69,14 +69,14 @@ MOE_ARGS=(
 DATA_ARGS=(
     --mock-data
     --tokenizer-type NullTokenizer
-    --vocab-size 1024
+    --vocab-size 32000
     --split 100,0,0 # train, validation, test. This does not represent the absolute num.
 )
 
 
 TRAINING_ARGS=(
-    --micro-batch-size 4 # The example uses 1
-    --global-batch-size 32 # The example uses 128 (***)
+    --micro-batch-size 2 # The example uses 1
+    --global-batch-size 128 # The example uses 128 (***)
     --lr 1e-4 # The example uses 1e-4
     --train-iters 10 # The example uses 500000 (***)
     --lr-decay-iters 10 # The example uses 320000 (***)
@@ -93,7 +93,7 @@ TRAINING_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 8 # The example uses 1
+    --tensor-model-parallel-size 1 # The example uses 1
     --pipeline-model-parallel-size 1 # The example uses 4, but megatron fsdp needs pp = 1
     # --num-layers-per-virtual-pipeline-stage 8 # The example enables vertiual pp
     --sequence-parallel

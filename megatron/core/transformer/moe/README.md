@@ -571,6 +571,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 |----------|-------------|---------|
 | --moe-per-layer-logging | Per-layer logging | False |
 | --moe-router-force-load-balancing | Force load balancing (experimental) | False |
+| --moe-router-force-uniform-routing | Force deterministic uniform expert routing for profiling (experimental) | False |
 
 ## Examples
 ```bash

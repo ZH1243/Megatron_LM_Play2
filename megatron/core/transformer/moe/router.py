@@ -584,6 +584,62 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
+    def _uniform_routing(self, logits: torch.Tensor):
+        """Route token-expert assignments in a deterministic round-robin pattern."""
+        num_tokens, num_experts = logits.shape
+        assert self.topk <= num_experts, (
+            f"moe_router_topk ({self.topk}) must be <= num_moe_experts ({num_experts}) "
+            "for uniform routing."
+        )
+
+        token_offsets = torch.arange(num_tokens, device=logits.device).unsqueeze(1) * self.topk
+        expert_offsets = torch.arange(self.topk, device=logits.device).unsqueeze(0)
+        top_indices = (token_offsets + expert_offsets).remainder(num_experts)
+
+        if self.score_function == "softmax":
+            if self.config.moe_router_pre_softmax:
+                scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+                probs = torch.gather(scores, dim=1, index=top_indices)
+            else:
+                scores = torch.gather(logits, dim=1, index=top_indices)
+                probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+        elif self.score_function in ("sigmoid", "sqrtsoftplus"):
+            if self.score_function == "sigmoid":
+                scores = torch.sigmoid(logits.float())
+            else:
+                scores = torch.nn.functional.softplus(logits.float()).sqrt()
+            scores = torch.gather(scores, dim=1, index=top_indices)
+            probs = (
+                scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+                if self.topk > 1
+                else scores
+            )
+        else:
+            raise ValueError(f"Invalid score_function: {self.score_function}")
+
+        if self.config.moe_router_topk_scaling_factor:
+            probs = probs * self.config.moe_router_topk_scaling_factor
+
+        probs = probs.type_as(logits)
+
+        if torch.are_deterministic_algorithms_enabled():
+            routing_probs = torch.zeros_like(logits)
+            rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+            routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
+
+            routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+            routing_map.index_put_(
+                (rows, top_indices),
+                torch.ones_like(probs, dtype=routing_map.dtype),
+                accumulate=False,
+            )
+            routing_map = routing_map.bool()
+        else:
+            routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+            routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+        return routing_probs, routing_map
+
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function
 
@@ -609,7 +665,9 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
-        if self.routing_type == "sinkhorn":
+        if self.config.moe_router_force_uniform_routing:
+            probs, routing_map = self._uniform_routing(logits)
+        elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
             probs, routing_map = topk_routing_with_score_function(
@@ -639,13 +697,16 @@ class TopKRouter(Router):
         # Apply each aux loss type and attach aux loss autograd function to probs
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
             # Calculate scores and routing_map for aux loss
-            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
-                logits,
-                self.topk,
-                self.score_function,
-                fused=self.config.moe_router_fusion,
-                padding_mask=padding_mask,
-            )
+            if self.config.moe_router_force_uniform_routing:
+                routing_map_for_aux_loss, scores_for_aux_loss = routing_map, probs
+            else:
+                routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                    logits,
+                    self.topk,
+                    self.score_function,
+                    fused=self.config.moe_router_fusion,
+                    padding_mask=padding_mask,
+                )
             probs = self._apply_aux_loss(
                 probs,
                 scores_for_aux_loss,

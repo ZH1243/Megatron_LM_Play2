@@ -238,6 +238,24 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_force_uniform_routing(self):
+        hidden_states = torch.randn(
+            (33, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+
+        self.router.config.moe_router_force_uniform_routing = True
+        scores, routing_map = self.router(hidden_states)
+
+        assert scores.shape == routing_map.shape
+        assert routing_map.sum(dim=1).eq(self.router.config.moe_router_topk).all()
+
+        tokens_per_expert = routing_map.sum(dim=0)
+        assert (tokens_per_expert.max() - tokens_per_expert.min()) <= 1
+
+        self.router.config.moe_router_force_uniform_routing = False
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("capacity_factor", [None, 1.0, 2.0])
     @pytest.mark.parametrize("drop_policy", ["probs", "position"])
     @pytest.mark.parametrize("pad_to_capacity", [True, False])

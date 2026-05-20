@@ -57,6 +57,10 @@ MOE_ARGS=(
     # --moe-flex-dispatcher-backend hybridep
 )
 
+if [[ "${FORCE_UNIFORM_ROUTING:-0}" == "1" ]]; then
+    MOE_ARGS+=(--moe-router-force-uniform-routing)
+fi
+
 # # The example uses DATA_ARGS as shown below
 # DATA_ARGS=(
 #     --tokenizer-type Llama2Tokenizer

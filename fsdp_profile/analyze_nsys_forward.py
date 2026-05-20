@@ -37,6 +37,10 @@ LAYER_MLP_RE = re.compile(r"layer=(?P<layer>\d+)\.(?P<kind>moe|mlp)_compute")
 FSDP_FORWARD_RE = re.compile(r"CustomFSDP\.forward")
 FSDP_OP_ID_RE = re.compile(r"op_id\s*=\s*(?P<op_id>[^,\s]+)")
 PREFETCH_LAYER_RE = re.compile(r"prefetch\.layer=(?P<layer>\d+)")
+EXPERT_FFN_RE = re.compile(r"GroupedLinear")
+EXPERT_ACTIVATION_RE = re.compile(
+    r"(WeightedSwiGLUFunction|BiasSwiGLUFunction|SwiGLUFunction|GeGLU|ReGLU|SwiGLU|GELU|ReLU)"
+)
 
 
 @dataclass(frozen=True)
@@ -122,6 +126,9 @@ class LayerOccurrence:
     dispatch_hidden_states_kernels: KernelStats = field(default_factory=KernelStats)
     dispatch_metadata_tokens_per_expert_kernels: KernelStats = field(default_factory=KernelStats)
     combine_kernels: KernelStats = field(default_factory=KernelStats)
+    ffn1_kernels: KernelStats = field(default_factory=KernelStats)
+    activation_kernels: KernelStats = field(default_factory=KernelStats)
+    ffn2_kernels: KernelStats = field(default_factory=KernelStats)
     prefetch_kernels: KernelStats = field(default_factory=KernelStats)
 
     @property
@@ -508,6 +515,49 @@ def assign_moe_comm(
             owner.combine_kernels.add_stats(kernels.stats_for_range(nvtx_range))
 
 
+def assign_moe_expert_compute(
+    occurrences: list[LayerOccurrence], nvtx_ranges: list[NvtxRange], kernels: KernelIndexer
+) -> None:
+    """Attribute expert FFN/activation ranges by their order inside each MoE compute range."""
+
+    moe_occurrences = [item for item in occurrences if item.mlp is not None and item.mlp_kind == "moe"]
+    for occurrence in moe_occurrences:
+        if occurrence.mlp is None:
+            continue
+
+        children = [
+            item
+            for item in nvtx_ranges
+            if (
+                item.row_id != occurrence.mlp.row_id
+                and occurrence.mlp.start <= item.start
+                and item.end <= occurrence.mlp.end
+            )
+        ]
+        children.sort(key=lambda item: (item.start, item.end))
+
+        activation_index: int | None = None
+        for index, child in enumerate(children):
+            if EXPERT_ACTIVATION_RE.search(child.text):
+                activation_index = index
+                occurrence.activation_kernels.add_stats(kernels.stats_for_range(child))
+
+        if activation_index is None:
+            continue
+
+        ffn_before_activation = [
+            child for child in children[:activation_index] if EXPERT_FFN_RE.search(child.text)
+        ]
+        ffn_after_activation = [
+            child for child in children[activation_index + 1 :] if EXPERT_FFN_RE.search(child.text)
+        ]
+
+        if ffn_before_activation:
+            occurrence.ffn1_kernels.add_stats(kernels.stats_for_range(ffn_before_activation[-1]))
+        if ffn_after_activation:
+            occurrence.ffn2_kernels.add_stats(kernels.stats_for_range(ffn_after_activation[0]))
+
+
 def is_prefetch_range(text: str, direction: str) -> bool:
     if "param_all_gather" not in text or "prefetch.layer=" not in text:
         return False
@@ -639,6 +689,12 @@ def layer_rows(occurrences: list[LayerOccurrence]) -> list[dict[str, Any]]:
                 ),
                 "moe_combine_kernel_ms": occurrence.combine_kernels.total_ms,
                 "moe_combine_kernel_count": occurrence.combine_kernels.count,
+                "moe_ffn1_kernel_ms": occurrence.ffn1_kernels.total_ms,
+                "moe_ffn1_kernel_count": occurrence.ffn1_kernels.count,
+                "moe_activation_kernel_ms": occurrence.activation_kernels.total_ms,
+                "moe_activation_kernel_count": occurrence.activation_kernels.count,
+                "moe_ffn2_kernel_ms": occurrence.ffn2_kernels.total_ms,
+                "moe_ffn2_kernel_count": occurrence.ffn2_kernels.count,
                 "param_prefetch_kernel_ms": occurrence.prefetch_kernels.total_ms,
                 "param_prefetch_kernel_count": occurrence.prefetch_kernels.count,
                 "top_prefetch_kernels": "; ".join(
@@ -657,6 +713,15 @@ def layer_rows(occurrences: list[LayerOccurrence]) -> list[dict[str, Any]]:
                 ),
                 "top_combine_kernels": "; ".join(
                     f"{name} ({count:g})" for name, count in occurrence.combine_kernels.names.most_common(3)
+                ),
+                "top_ffn1_kernels": "; ".join(
+                    f"{name} ({count:g})" for name, count in occurrence.ffn1_kernels.names.most_common(3)
+                ),
+                "top_activation_kernels": "; ".join(
+                    f"{name} ({count:g})" for name, count in occurrence.activation_kernels.names.most_common(3)
+                ),
+                "top_ffn2_kernels": "; ".join(
+                    f"{name} ({count:g})" for name, count in occurrence.ffn2_kernels.names.most_common(3)
                 ),
             }
         )
@@ -678,6 +743,9 @@ def summary_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "moe_dispatch_hidden_states_kernel_ms",
         "moe_dispatch_metadata_tokens_per_expert_kernel_ms",
         "moe_combine_kernel_ms",
+        "moe_ffn1_kernel_ms",
+        "moe_activation_kernel_ms",
+        "moe_ffn2_kernel_ms",
         "param_prefetch_kernel_ms",
     ]
     summaries: list[dict[str, Any]] = []
@@ -717,6 +785,9 @@ def print_summary(rows: list[dict[str, Any]], limit: int | None, statistic: str)
         ("disp_hid", f"{prefix}_moe_dispatch_hidden_states_kernel_ms"),
         ("disp_meta", f"{prefix}_moe_dispatch_metadata_tokens_per_expert_kernel_ms"),
         ("combine", f"{prefix}_moe_combine_kernel_ms"),
+        ("ffn1", f"{prefix}_moe_ffn1_kernel_ms"),
+        ("activation", f"{prefix}_moe_activation_kernel_ms"),
+        ("ffn2", f"{prefix}_moe_ffn2_kernel_ms"),
         ("prefetch", f"{prefix}_param_prefetch_kernel_ms"),
     ]
     print(f"Summary {statistic} values in ms:")
@@ -742,6 +813,9 @@ def print_outlier_notes(rows: list[dict[str, Any]], top_n: int = 5) -> None:
         ("moe_dispatch_hidden_states_kernel_ms", "disp_hid"),
         ("moe_dispatch_metadata_tokens_per_expert_kernel_ms", "disp_meta"),
         ("moe_combine_kernel_ms", "combine"),
+        ("moe_ffn1_kernel_ms", "ffn1"),
+        ("moe_activation_kernel_ms", "activation"),
+        ("moe_ffn2_kernel_ms", "ffn2"),
         ("layer_kernel_ms", "layer_gpu"),
     ]
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -898,6 +972,7 @@ def main() -> int:
             raise RuntimeError("No `layer=N.attention_compute` NVTX ranges were found.")
 
         assign_moe_comm(occurrences, nvtx_ranges, kernel_indexer)
+        assign_moe_expert_compute(occurrences, nvtx_ranges, kernel_indexer)
         multi_layer_groups = assign_prefetch(
             occurrences,
             nvtx_ranges,

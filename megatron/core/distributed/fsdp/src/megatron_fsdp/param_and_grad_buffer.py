@@ -3932,21 +3932,27 @@ class AllGatherPipeline:
         non_moe_prefetch_groups = []
         moe_prefetch_groups = []
         for buckets in bucket_groups:
-            if any(bucket_id in requested_ag_buckets for bucket_id in buckets):
-                current_groups.append(buckets)
-            else:
-                non_moe_buckets = [
-                    bucket_id
-                    for bucket_id in buckets
-                    if not self._bucket_belongs_to_moe_layer(bucket_id)
-                ]
-                moe_buckets = [
-                    bucket_id for bucket_id in buckets if self._bucket_belongs_to_moe_layer(bucket_id)
-                ]
-                if non_moe_buckets:
-                    non_moe_prefetch_groups.append(non_moe_buckets)
-                if moe_buckets:
-                    moe_prefetch_groups.append(moe_buckets)
+            current_buckets = [
+                bucket_id for bucket_id in buckets if bucket_id in requested_ag_buckets
+            ]
+            non_moe_prefetch_buckets = [
+                bucket_id
+                for bucket_id in buckets
+                if bucket_id not in requested_ag_buckets
+                and not self._bucket_belongs_to_moe_layer(bucket_id)
+            ]
+            moe_prefetch_buckets = [
+                bucket_id
+                for bucket_id in buckets
+                if bucket_id not in requested_ag_buckets
+                and self._bucket_belongs_to_moe_layer(bucket_id)
+            ]
+            if current_buckets:
+                current_groups.append(current_buckets)
+            if non_moe_prefetch_buckets:
+                non_moe_prefetch_groups.append(non_moe_prefetch_buckets)
+            if moe_prefetch_buckets:
+                moe_prefetch_groups.append(moe_prefetch_buckets)
         return current_groups + non_moe_prefetch_groups + moe_prefetch_groups
 
     def _get_bucket_layer_label(self, bucket_id: int) -> str:
@@ -4215,8 +4221,17 @@ class AllGatherPipeline:
                 self._bucket_belongs_to_moe_layer(bucket_id) for bucket_id in buckets
             )
             if is_moe_prefetch_group:
-                for bucket_id in pending_non_moe_prefetch_buckets:
-                    self.wait_bucket_ready(bucket_id, bwd)
+                if pending_non_moe_prefetch_buckets:
+                    nvtx_msg = (
+                        "fsdp.sequential_moe_prefetch.wait_non_moe_prefetch."
+                        f"buckets={'+'.join(str(bucket_id) for bucket_id in pending_non_moe_prefetch_buckets)}"
+                    )
+                    torch.cuda.nvtx.range_push(nvtx_msg)
+                    try:
+                        for bucket_id in pending_non_moe_prefetch_buckets:
+                            self.wait_bucket_ready(bucket_id, bwd)
+                    finally:
+                        torch.cuda.nvtx.range_pop()
                 pending_non_moe_prefetch_buckets = []
 
             all_gather_stream = (

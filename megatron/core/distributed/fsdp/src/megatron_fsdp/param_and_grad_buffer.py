@@ -3924,7 +3924,7 @@ class AllGatherPipeline:
     def _order_bucket_groups_for_prefetch(
         self, bucket_groups: List[List[int]], requested_ag_buckets: set, prefetch: bool
     ) -> List[List[int]]:
-        """Place pure MoE prefetch groups after pure non-MoE prefetch groups."""
+        """Place pure MoE prefetch buckets after pure non-MoE prefetch buckets."""
         if not prefetch or not self.buffer.ddp_config.fsdp_sequential_moe_prefetch:
             return bucket_groups
 
@@ -3934,10 +3934,19 @@ class AllGatherPipeline:
         for buckets in bucket_groups:
             if any(bucket_id in requested_ag_buckets for bucket_id in buckets):
                 current_groups.append(buckets)
-            elif any(self._bucket_belongs_to_moe_layer(bucket_id) for bucket_id in buckets):
-                moe_prefetch_groups.append(buckets)
             else:
-                non_moe_prefetch_groups.append(buckets)
+                non_moe_buckets = [
+                    bucket_id
+                    for bucket_id in buckets
+                    if not self._bucket_belongs_to_moe_layer(bucket_id)
+                ]
+                moe_buckets = [
+                    bucket_id for bucket_id in buckets if self._bucket_belongs_to_moe_layer(bucket_id)
+                ]
+                if non_moe_buckets:
+                    non_moe_prefetch_groups.append(non_moe_buckets)
+                if moe_buckets:
+                    moe_prefetch_groups.append(moe_buckets)
         return current_groups + non_moe_prefetch_groups + moe_prefetch_groups
 
     def _get_bucket_layer_label(self, bucket_id: int) -> str:
@@ -4197,7 +4206,7 @@ class AllGatherPipeline:
             list(bucket_group_to_buckets.values()), requested_ag_buckets, prefetch
         )
 
-        pending_non_moe_prefetch_events = []
+        pending_non_moe_prefetch_buckets = []
 
         # Coalesce all-gather operations for all buckets in the same data-parallel-group
         for buckets in bucket_groups:
@@ -4206,9 +4215,9 @@ class AllGatherPipeline:
                 self._bucket_belongs_to_moe_layer(bucket_id) for bucket_id in buckets
             )
             if is_moe_prefetch_group:
-                for prefetch_event in pending_non_moe_prefetch_events:
-                    prefetch_event.wait()
-                pending_non_moe_prefetch_events = []
+                for bucket_id in pending_non_moe_prefetch_buckets:
+                    self.wait_bucket_ready(bucket_id, bwd)
+                pending_non_moe_prefetch_buckets = []
 
             all_gather_stream = (
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
@@ -4299,7 +4308,7 @@ class AllGatherPipeline:
                 and is_prefetch_group
                 and not is_moe_prefetch_group
             ):
-                pending_non_moe_prefetch_events.append(coalescing_event)
+                pending_non_moe_prefetch_buckets.extend(buckets)
 
         # Wait for all-gather to finish
         if not async_param_gather:

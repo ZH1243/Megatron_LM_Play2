@@ -89,6 +89,13 @@ class DistributedDataParallelConfig:
     initial communication cost.
     """
 
+    fsdp_sequential_moe_prefetch: bool = False
+    """
+    If True, Megatron-FSDP launches MoE-layer parameter prefetches only after
+    earlier non-MoE prefetch all-gathers have completed. This is disabled by
+    default to preserve the original overlapped prefetch behavior.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 

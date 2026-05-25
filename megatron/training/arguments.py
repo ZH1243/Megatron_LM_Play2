@@ -2817,6 +2817,9 @@ def _add_distributed_args(parser):
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
                         'while a smaller value disables prefetching and may degrade performance. Adjust this value based on your system\'s memory '
                         'and performance requirements.')
+    group.add_argument('--fsdp-sequential-moe-prefetch', action='store_true',
+                       help='If set, Megatron-FSDP waits for non-MoE parameter prefetch '
+                       'all-gathers to finish before launching MoE-layer prefetch all-gathers.')
     group.add_argument('--keep-fp8-transpose-cache', action='store_true',
                        help='If set, keep the fp8 transpose cache when using Megatron FSDP.')
     group.add_argument('--enable-full-sharding-in-hsdp', action='store_true',

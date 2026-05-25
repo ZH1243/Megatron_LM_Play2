@@ -150,6 +150,13 @@ class DistributedDataParallelConfig:
     initial communication cost.
     """
 
+    fsdp_sequential_moe_prefetch: bool = False
+    """
+    If True, Megatron-FSDP launches MoE-layer parameter prefetches only after
+    earlier non-MoE prefetch all-gathers have completed. This is disabled by
+    default to preserve the original overlapped prefetch behavior.
+    """
+
     outer_dp_sharding_strategy: str = 'no_shard'
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.

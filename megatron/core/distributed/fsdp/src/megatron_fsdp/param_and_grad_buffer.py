@@ -3889,6 +3889,13 @@ class AllGatherPipeline:
                 for bucket_id in bucket_group:
                     self.bucket_to_bucket_group[bucket_id] = group_id
 
+        self.moe_fsdp_unit_ids = {
+            param_group.fsdp_unit_id
+            for param_group in self.buffer.parameter_groups
+            if param_group.fsdp_unit_id is not None
+            and self._parameter_group_has_moe_params(param_group)
+        }
+
         if (
             self.buffer.dist_index.use_hybrid_fsdp
             and self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard"
@@ -3896,6 +3903,42 @@ class AllGatherPipeline:
             # If there are multiple FSDP groups and full sharding, we need to
             # all-gather parameters across groups.
             self.outer_fsdp_group_param_gather_stream = torch.cuda.Stream()
+
+    def _parameter_group_has_moe_params(self, param_group: ParameterGroup) -> bool:
+        """Return True if a parameter group belongs to MoE routing or experts."""
+        if param_group.is_expert_param:
+            return True
+        for param in param_group.params:
+            param_name = self.buffer.param_to_name[param]
+            if any(token in param_name for token in [".experts.", ".router.", ".shared_expert"]):
+                return True
+        return False
+
+    def _bucket_belongs_to_moe_layer(self, bucket_id: int) -> bool:
+        """Return True if a bucket belongs to an FSDP unit containing MoE params."""
+        param_group = self.buffer.parameter_groups[bucket_id]
+        if param_group.fsdp_unit_id in self.moe_fsdp_unit_ids:
+            return True
+        return self._parameter_group_has_moe_params(param_group)
+
+    def _order_bucket_groups_for_prefetch(
+        self, bucket_groups: List[List[int]], requested_ag_buckets: set, prefetch: bool
+    ) -> List[List[int]]:
+        """Place pure MoE prefetch groups after pure non-MoE prefetch groups."""
+        if not prefetch or not self.buffer.ddp_config.fsdp_sequential_moe_prefetch:
+            return bucket_groups
+
+        current_groups = []
+        non_moe_prefetch_groups = []
+        moe_prefetch_groups = []
+        for buckets in bucket_groups:
+            if any(bucket_id in requested_ag_buckets for bucket_id in buckets):
+                current_groups.append(buckets)
+            elif any(self._bucket_belongs_to_moe_layer(bucket_id) for bucket_id in buckets):
+                moe_prefetch_groups.append(buckets)
+            else:
+                non_moe_prefetch_groups.append(buckets)
+        return current_groups + non_moe_prefetch_groups + moe_prefetch_groups
 
     def _get_bucket_layer_label(self, bucket_id: int) -> str:
         """Infer a human-readable layer label from parameter names in a bucket."""
@@ -4150,8 +4193,23 @@ class AllGatherPipeline:
                 bucket_group_to_buckets[group_id] = []
             bucket_group_to_buckets[group_id].append(bucket_id)
 
+        bucket_groups = self._order_bucket_groups_for_prefetch(
+            list(bucket_group_to_buckets.values()), requested_ag_buckets, prefetch
+        )
+
+        pending_non_moe_prefetch_events = []
+
         # Coalesce all-gather operations for all buckets in the same data-parallel-group
-        for _, buckets in bucket_group_to_buckets.items():
+        for buckets in bucket_groups:
+            is_prefetch_group = all(bucket_id not in requested_ag_buckets for bucket_id in buckets)
+            is_moe_prefetch_group = is_prefetch_group and any(
+                self._bucket_belongs_to_moe_layer(bucket_id) for bucket_id in buckets
+            )
+            if is_moe_prefetch_group:
+                for prefetch_event in pending_non_moe_prefetch_events:
+                    prefetch_event.wait()
+                pending_non_moe_prefetch_events = []
+
             all_gather_stream = (
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
             )
@@ -4235,6 +4293,13 @@ class AllGatherPipeline:
                     coalescing_event,
                     mark_bucket_ready_to_use,
                 )
+
+            if (
+                self.buffer.ddp_config.fsdp_sequential_moe_prefetch
+                and is_prefetch_group
+                and not is_moe_prefetch_group
+            ):
+                pending_non_moe_prefetch_events.append(coalescing_event)
 
         # Wait for all-gather to finish
         if not async_param_gather:

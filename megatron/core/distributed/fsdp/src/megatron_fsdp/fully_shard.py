@@ -102,6 +102,7 @@ def fully_shard_model(
     fsdp_double_buffer: bool = False,
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
+    fsdp_sequential_moe_prefetch: bool = False,
     enable_fine_grained_param_gather: bool = False,
     use_decoupled_grad: bool = False,
 ) -> torch.nn.Module:
@@ -359,6 +360,7 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        fsdp_sequential_moe_prefetch=fsdp_sequential_moe_prefetch,
         megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
     )
 
@@ -664,6 +666,7 @@ def fully_shard(
     fsdp_double_buffer: bool = False,
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
+    fsdp_sequential_moe_prefetch: bool = False,
     enable_fine_grained_param_gather: bool = False,
     use_decoupled_grad: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
@@ -715,6 +718,7 @@ def fully_shard(
         fsdp_double_buffer=fsdp_double_buffer,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        fsdp_sequential_moe_prefetch=fsdp_sequential_moe_prefetch,
         enable_fine_grained_param_gather=enable_fine_grained_param_gather,
         use_decoupled_grad=use_decoupled_grad,
     )

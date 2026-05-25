@@ -52,9 +52,11 @@ MOE_ARGS=(
     --moe-aux-loss-coeff 1e-2 # The example uses 1e-2 (***)
     --moe-grouped-gemm # The example uses grouped-gemm
     --moe-permute-fusion # The example uses permute-fusion
-    --moe-token-dispatcher-type alltoall # The example uses alltoall (***)
-    # --moe-token-dispatcher-type flex
-    # --moe-flex-dispatcher-backend hybridep
+    # --moe-token-dispatcher-type alltoall # The example uses alltoall (***)
+    --moe-router-dtype=fp32
+    --moe-token-dispatcher-type flex
+    --moe-flex-dispatcher-backend deepep
+    # --overlap-moe-expert-parallel-comm # 1F1B overlap
 )
 
 if [[ "${FORCE_UNIFORM_ROUTING:-0}" == "1" ]]; then
@@ -131,7 +133,7 @@ PROFILE_ARGS=(
     --profile                    # Enables nsys profiling
     --profile-step-start 5       # Start capturing at this step (skip warmup)
     --profile-step-end 8        # Stop capturing after this step
-    --profile-ranks 0 8           # Which ranks to profile (default: all — expensive!)
+    --profile-ranks 0 8          # Which ranks to profile (default: all — expensive!)
     --nvtx-ranges
 )
 
@@ -139,17 +141,54 @@ PROFILE_ARGS=(
 
 export LD_PRELOAD=/jizhicfs/johnnyslin/anaconda3/envs/zh_megatron_312/lib/python3.12/site-packages/transformer_engine/wheel_lib/libtransformer_engine.so${LD_PRELOAD:+:$LD_PRELOAD}
 
+# torchrun "${DISTRIBUTED_ARGS[@]}" \
+#   --no-python \
+#   nsys profile \
+#     -s none \
+#     --cpuctxsw=none \
+#     --trace=cuda,nvtx,cudnn,cublas \
+#     --capture-range=cudaProfilerApi \
+#     --capture-range-end=stop \
+#     --output="${CHECKPOINT_PATH}/profile_node_${NODE_RANK}_rank_%q{RANK}_local_%q{LOCAL_RANK}" \
+#     --gpu-metrics-devices=%q{LOCAL_RANK} \
+#     --gpu-metrics-set=gh100 \
+#     --gpu-metrics-frequency=10000 \
+#     --force-overwrite=true \
+#   python pretrain_gpt.py \
+#     "${MODEL_ARGS[@]}" \
+#     "${MOE_ARGS[@]}" \
+#     "${DATA_ARGS[@]}" \
+#     "${TRAINING_ARGS[@]}" \
+#     "${MODEL_PARALLEL_ARGS[@]}" \
+#     "${LOGGING_ARGS[@]}" \
+#     "${PROFILE_ARGS[@]}" \
+#     "${FSDP_ARGS[@]}"
+
+export CHECKPOINT_PATH NODE_RANK
+chmod +x ./fsdp_profile/run_with_nsys.sh
+
+# # Force the NCCL choices for this profiling experiment. Using ${VAR:-...}
+# # here would keep an inherited NCCL_PROTO=LL/LL128 from the submit environment.
+# export NCCL_ALGO=Ring
+# # Force Simple by excluding both low-latency protocol variants.
+# # export NCCL_PROTO="^LL,LL128"
+# export NCCL_PROTO="LL128"
+# # Disable external NCCL plugins that can inject or tune communicator policy.
+# export NCCL_TUNER_PLUGIN=none
+# export NCCL_ENV_PLUGIN=none
+
+if [[ "${NCCL_DEBUG_PROTO:-0}" == "1" ]]; then
+    mkdir -p "${CHECKPOINT_PATH}/nccl_debug"
+    export NCCL_DEBUG=INFO
+    export NCCL_DEBUG_SUBSYS=ENV,INIT,TUNING
+    export NCCL_DEBUG_FILE="${CHECKPOINT_PATH}/nccl_debug/nccl_%h_%p.log"
+fi
+
+# echo "[run_and_profile_moe] NCCL_ALGO=${NCCL_ALGO} NCCL_PROTO=${NCCL_PROTO} NCCL_TUNER_PLUGIN=${NCCL_TUNER_PLUGIN} NCCL_ENV_PLUGIN=${NCCL_ENV_PLUGIN}"
+
 torchrun "${DISTRIBUTED_ARGS[@]}" \
   --no-python \
-  nsys profile \
-    -s none \
-    --cpuctxsw=none \
-    --trace=cuda,nvtx,cudnn,cublas \
-    --capture-range=cudaProfilerApi \
-    --capture-range-end=stop \
-    --output="${CHECKPOINT_PATH}/profile_node_${NODE_RANK}_rank_%q{RANK}_local_%q{LOCAL_RANK}" \
-    --force-overwrite=true \
-  python pretrain_gpt.py \
+  ./fsdp_profile/run_with_nsys.sh \
     "${MODEL_ARGS[@]}" \
     "${MOE_ARGS[@]}" \
     "${DATA_ARGS[@]}" \

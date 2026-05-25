@@ -3955,6 +3955,17 @@ class AllGatherPipeline:
                 moe_prefetch_groups.append(moe_prefetch_buckets)
         return current_groups + non_moe_prefetch_groups + moe_prefetch_groups
 
+    def _get_outstanding_non_moe_bucket_ids(self, bwd: bool) -> List[int]:
+        """Return outstanding non-MoE all-gather buckets for this pass direction."""
+        bucket_ids = []
+        for bucket_key in list(self.param_gather_event_map):
+            bucket_id = bucket_key[0]
+            if bucket_key != self.get_bucket_key(bucket_id, bwd):
+                continue
+            if not self._bucket_belongs_to_moe_layer(bucket_id):
+                bucket_ids.append(bucket_id)
+        return bucket_ids
+
     def _get_bucket_layer_label(self, bucket_id: int) -> str:
         """Infer a human-readable layer label from parameter names in a bucket."""
         param_names = [
@@ -4212,7 +4223,7 @@ class AllGatherPipeline:
             list(bucket_group_to_buckets.values()), requested_ag_buckets, prefetch
         )
 
-        pending_non_moe_prefetch_buckets = []
+        pending_non_moe_buckets = []
 
         # Coalesce all-gather operations for all buckets in the same data-parallel-group
         for buckets in bucket_groups:
@@ -4221,18 +4232,33 @@ class AllGatherPipeline:
                 self._bucket_belongs_to_moe_layer(bucket_id) for bucket_id in buckets
             )
             if is_moe_prefetch_group:
-                if pending_non_moe_prefetch_buckets:
+                pending_non_moe_buckets = list(
+                    dict.fromkeys(
+                        pending_non_moe_buckets + self._get_outstanding_non_moe_bucket_ids(bwd)
+                    )
+                )
+                if pending_non_moe_buckets:
                     nvtx_msg = (
-                        "fsdp.sequential_moe_prefetch.wait_non_moe_prefetch."
-                        f"buckets={'+'.join(str(bucket_id) for bucket_id in pending_non_moe_prefetch_buckets)}"
+                        "fsdp.sequential_moe_prefetch.wait_non_moe."
+                        f"buckets={'+'.join(str(bucket_id) for bucket_id in pending_non_moe_buckets)}"
                     )
                     torch.cuda.nvtx.range_push(nvtx_msg)
                     try:
-                        for bucket_id in pending_non_moe_prefetch_buckets:
+                        for bucket_id in pending_non_moe_buckets:
                             self.wait_bucket_ready(bucket_id, bwd)
+                        sync_stream = (
+                            self.ag_stream
+                            if self.ag_stream is not None
+                            else torch.cuda.current_stream()
+                        )
+                        sync_stream.synchronize()
+                        if outer_fsdp_group_param_gather and hasattr(
+                            self, "outer_fsdp_group_param_gather_stream"
+                        ):
+                            self.outer_fsdp_group_param_gather_stream.synchronize()
                     finally:
                         torch.cuda.nvtx.range_pop()
-                pending_non_moe_prefetch_buckets = []
+                pending_non_moe_buckets = []
 
             all_gather_stream = (
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
@@ -4318,12 +4344,14 @@ class AllGatherPipeline:
                     mark_bucket_ready_to_use,
                 )
 
-            if (
-                self.buffer.ddp_config.fsdp_sequential_moe_prefetch
-                and is_prefetch_group
-                and not is_moe_prefetch_group
-            ):
-                pending_non_moe_prefetch_buckets.extend(buckets)
+            if self.buffer.ddp_config.fsdp_sequential_moe_prefetch and not is_moe_prefetch_group:
+                pending_non_moe_buckets.extend(
+                    [
+                        bucket_id
+                        for bucket_id in buckets
+                        if not self._bucket_belongs_to_moe_layer(bucket_id)
+                    ]
+                )
 
         # Wait for all-gather to finish
         if not async_param_gather:

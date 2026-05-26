@@ -2820,6 +2820,10 @@ def _add_distributed_args(parser):
     group.add_argument('--fsdp-sequential-prefetch', action='store_true',
                        help='If set, serialize Megatron-FSDP parameter prefetch bucket groups. '
                        'This prevents dense and expert MoE prefetch all-gathers from running concurrently.')
+    group.add_argument('--fsdp-sequential-prefetch-order', type=str, default='default',
+                       choices=['default', 'moe_first', 'non_moe_first'],
+                       help='Order for serialized Megatron-FSDP parameter prefetch bucket groups. '
+                       'Only effective with --fsdp-sequential-prefetch.')
     group.add_argument('--keep-fp8-transpose-cache', action='store_true',
                        help='If set, keep the fp8 transpose cache when using Megatron FSDP.')
     group.add_argument('--enable-full-sharding-in-hsdp', action='store_true',

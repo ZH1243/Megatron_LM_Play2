@@ -127,6 +127,7 @@ FSDP_ARGS=(
     --ckpt-format fsdp_dtensor    
     --fsdp-double-buffer
     --fsdp-sequential-prefetch
+    --fsdp-sequential-prefetch-order moe_first
 )
 
 # Not shown in the example

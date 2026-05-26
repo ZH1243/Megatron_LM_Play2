@@ -110,6 +110,10 @@ class DistributedDataParallelConfig:
       This prevents prefetch all-gathers from different bucket groups, such as
       dense and expert buckets in MoE layers, from running concurrently."""
 
+    fsdp_sequential_prefetch_order: str = "default"
+    """Order for serialized Megatron-FSDP prefetch bucket groups.
+      Valid values are 'default', 'moe_first', and 'non_moe_first'."""
+
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
@@ -224,6 +228,13 @@ class DistributedDataParallelConfig:
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
+
+        valid_prefetch_orders = {"default", "moe_first", "non_moe_first"}
+        if self.fsdp_sequential_prefetch_order not in valid_prefetch_orders:
+            raise ValueError(
+                "fsdp_sequential_prefetch_order must be one of "
+                f"{sorted(valid_prefetch_orders)}, got {self.fsdp_sequential_prefetch_order!r}"
+            )
 
         if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
             assert not self.grad_reduce_in_fp32, (

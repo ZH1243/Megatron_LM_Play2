@@ -4150,11 +4150,36 @@ class AllGatherPipeline:
                 bucket_group_to_buckets[group_id] = []
             bucket_group_to_buckets[group_id].append(bucket_id)
 
+        def is_prefetch_group(buckets):
+            return any(bucket_id not in requested_ag_buckets for bucket_id in buckets)
+
         bucket_groups = list(bucket_group_to_buckets.values())
+        if getattr(self.buffer.ddp_config, "fsdp_sequential_prefetch", False):
+            prefetch_order = getattr(
+                self.buffer.ddp_config, "fsdp_sequential_prefetch_order", "default"
+            )
+            if prefetch_order != "default":
+
+                def prefetch_group_sort_key(buckets):
+                    is_expert_group = parameter_groups[buckets[0]].is_expert_param
+                    if prefetch_order == "moe_first":
+                        return 0 if is_expert_group else 1
+                    return 0 if not is_expert_group else 1
+
+                prefetch_groups = sorted(
+                    [buckets for buckets in bucket_groups if is_prefetch_group(buckets)],
+                    key=prefetch_group_sort_key,
+                )
+                prefetch_groups_iter = iter(prefetch_groups)
+                bucket_groups = [
+                    next(prefetch_groups_iter) if is_prefetch_group(buckets) else buckets
+                    for buckets in bucket_groups
+                ]
+
         prefetch_group_indices = {
             group_index
             for group_index, buckets in enumerate(bucket_groups)
-            if any(bucket_id not in requested_ag_buckets for bucket_id in buckets)
+            if is_prefetch_group(buckets)
         }
 
         # Coalesce all-gather operations for all buckets in the same data-parallel-group

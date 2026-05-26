@@ -126,6 +126,7 @@ FSDP_ARGS=(
     --no-gradient-accumulation-fusion
     --ckpt-format fsdp_dtensor    
     --fsdp-double-buffer
+    --fsdp-sequential-prefetch
 )
 
 # Not shown in the example

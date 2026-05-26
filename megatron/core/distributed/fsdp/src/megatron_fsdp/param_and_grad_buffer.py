@@ -4150,8 +4150,15 @@ class AllGatherPipeline:
                 bucket_group_to_buckets[group_id] = []
             bucket_group_to_buckets[group_id].append(bucket_id)
 
+        bucket_groups = list(bucket_group_to_buckets.values())
+        prefetch_group_indices = {
+            group_index
+            for group_index, buckets in enumerate(bucket_groups)
+            if any(bucket_id not in requested_ag_buckets for bucket_id in buckets)
+        }
+
         # Coalesce all-gather operations for all buckets in the same data-parallel-group
-        for _, buckets in bucket_group_to_buckets.items():
+        for group_index, buckets in enumerate(bucket_groups):
             all_gather_stream = (
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
             )
@@ -4235,6 +4242,17 @@ class AllGatherPipeline:
                     coalescing_event,
                     mark_bucket_ready_to_use,
                 )
+
+            if (
+                getattr(self.buffer.ddp_config, "fsdp_sequential_prefetch", False)
+                and group_index in prefetch_group_indices
+                and any(
+                    next_group_index in prefetch_group_indices
+                    for next_group_index in range(group_index + 1, len(bucket_groups))
+                )
+            ):
+                for bucket_id in buckets:
+                    self.wait_bucket_ready(bucket_id, bwd)
 
         # Wait for all-gather to finish
         if not async_param_gather:

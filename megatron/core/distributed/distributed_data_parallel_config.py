@@ -105,6 +105,11 @@ class DistributedDataParallelConfig:
       disables prefetching and may degrade performance. Adjust this value
       based on your system's memory and performance requirements."""
 
+    fsdp_sequential_prefetch: bool = False
+    """If true, serialize Megatron-FSDP parameter prefetch bucket groups.
+      This prevents prefetch all-gathers from different bucket groups, such as
+      dense and expert buckets in MoE layers, from running concurrently."""
+
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
